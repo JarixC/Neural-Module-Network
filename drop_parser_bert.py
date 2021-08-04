@@ -1,3 +1,4 @@
+import copy
 import logging
 from typing import List, Dict, Any, Tuple, Optional, Set, Union
 import numpy as np
@@ -10,6 +11,7 @@ from allennlp.models.model import Model
 from allennlp.modules import Attention, Seq2SeqEncoder
 from allennlp.nn import Activation
 from allennlp.modules.matrix_attention import DotProductMatrixAttention, LinearMatrixAttention
+from allennlp.modules.token_embedders import Embedding
 import allennlp.nn.util as allenutil
 from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.models.reading_comprehension.util import get_best_span
@@ -76,6 +78,9 @@ class DROPParserBERT(DROPParserBase):
         cuda_device: int = -1,
         initializers: InitializerApplicator = InitializerApplicator(),
         regularizer: Optional[RegularizerApplicator] = None,
+        syntax_encoder_layer: Seq2SeqEncoder = None,
+        syntax_encoder: Seq2SeqEncoder = None,
+        syntax_semantic_encoder: Seq2SeqEncoder = None,
     ) -> None:
 
         super(DROPParserBERT, self).__init__(
@@ -107,6 +112,9 @@ class DROPParserBERT(DROPParserBase):
                 self.BERT = BertModel.from_pretrained(pretrained_bert_model)
                 self.bert_token_embedder = None
                 self.bert_dim = self.BERT.pooler.dense.out_features
+
+        self.syntax_embedding = Embedding(num_embeddings=29, embedding_dim=32, vocab_namespace="tags")
+        self.semantic_embedding = Embedding(num_embeddings=980, embedding_dim=32, vocab_namespace="sems")
 
         # bert_dim = self.BERT.pooler.dense.out_features
         # self.bert_dim = bert_dim
@@ -219,9 +227,18 @@ class DROPParserBERT(DROPParserBase):
         self.profile_steps = 0
         self.profile_freq = None if profile_freq == 0 else profile_freq
 
-        self.device_id = None
+        self.device_id = cuda_device
 
         self.interpret = interpret
+
+        self.syntax_encoder_layer = syntax_encoder_layer
+        self.syntax_linear_layer = torch.nn.Linear(self.syntax_encoder_layer.get_output_dim(), self.bert_dim)
+
+        self.syntax_encoder = syntax_encoder
+        self.syntax_linear_layer = torch.nn.Linear(self.bert_dim + 64, self.bert_dim)
+
+        self.syntax_semantic_encoder = syntax_semantic_encoder
+        self.syntax_semantic_linear_layer = torch.nn.Linear(self.bert_dim + 64 * 2, self.bert_dim)
 
         # self.logfile = open("log_sup_epochs_3.txt", "w")
         # self.num_train_steps = 0
@@ -275,6 +292,12 @@ class DROPParserBERT(DROPParserBase):
         aux_passage_attention=None,
         aux_answer_as_count=None,
         aux_count_mask=None,
+        question_syntax=None,
+        passage_syntax=None,
+        question_parent_syntax=None,
+        passage_parent_syntax=None,
+        question_semantic=None,
+        passage_semantic=None,
     ) -> Dict[str, torch.Tensor]:
 
         if self.device_id is None:
@@ -306,7 +329,73 @@ class DROPParserBERT(DROPParserBase):
         encoded_question = bert_out[:, 1 : self.max_ques_len + 1, :]
         question_mask = (pad_mask[:, 1 : self.max_ques_len + 1]).float()
         # Skip [CLS] Q_tokens [SEP]
-        encoded_passage = bert_out[:, 1 + self.max_ques_len + 1 :, :]
+        encoded_passage = bert_out[:, 1 + self.max_ques_len + 1:, :]
+        passage_mask = (pad_mask[:, 1 + self.max_ques_len + 1:]).float()
+
+        if question_semantic is not None:
+            syntax_question = self.syntax_embedding(question_syntax["tags"])
+            syntax_passage = self.syntax_embedding(passage_syntax["tags"])
+            semantic_question = self.semantic_embedding(question_semantic["sems"])
+            semantic_passage = self.semantic_embedding(passage_semantic["sems"])
+
+            # question_cat = torch.cat((encoded_question, syntax_question), -1)
+            # passage_cat = torch.cat((encoded_passage, syntax_passage), -1)
+            # syntax_question = self.syntax_encoder_layer(question_cat, question_mask)
+            # syntax_passage = self.syntax_encoder_layer(passage_cat, passage_mask)
+            # encoded_question = self.syntax_linear_layer(syntax_question)
+            # encoded_passage = self.syntax_linear_layer(syntax_passage)
+
+            syntax_semantic_question = self.syntax_semantic_encoder(torch.cat((syntax_question, semantic_question), -1),
+                                                                    question_mask)
+            syntax_semantic_passage = self.syntax_semantic_encoder(torch.cat((syntax_passage, semantic_passage), -1),
+                                                                   passage_mask)
+            encoded_question = self.syntax_semantic_linear_layer(torch.cat((encoded_question, syntax_semantic_question), -1))
+            encoded_passage = self.syntax_semantic_linear_layer(torch.cat((encoded_passage, syntax_semantic_passage), -1))
+
+        elif question_parent_syntax is not None:
+            syntax_question = self.syntax_embedding(question_syntax["tags"])
+            syntax_passage = self.syntax_embedding(passage_syntax["tags"])
+
+            parent_syntax_question = self.syntax_embedding(question_parent_syntax["tags"])
+            parent_syntax_passage = self.syntax_embedding(passage_parent_syntax["tags"])
+
+            question_cat = torch.cat((encoded_question, syntax_question, parent_syntax_question), -1)
+            passage_cat = torch.cat((encoded_passage, syntax_passage, parent_syntax_passage), -1)
+
+            syntax_question = self.syntax_encoder_layer(question_cat, question_mask)
+            syntax_passage = self.syntax_encoder_layer(passage_cat, passage_mask)
+
+            encoded_question = self.syntax_linear_layer(syntax_question)
+            encoded_passage = self.syntax_linear_layer(syntax_passage)
+
+        elif question_syntax is not None:
+            syntax_question = self.syntax_embedding(question_syntax["tags"])
+            syntax_passage = self.syntax_embedding(passage_syntax["tags"])
+
+            question_cat = torch.cat((encoded_question, syntax_question), -1)
+            passage_cat = torch.cat((encoded_passage, syntax_passage), -1)
+            syntax_question = self.syntax_encoder_layer(question_cat, question_mask)
+            syntax_passage = self.syntax_encoder_layer(passage_cat, passage_mask)
+            encoded_question = self.syntax_linear_layer(syntax_question)
+            encoded_passage = self.syntax_linear_layer(syntax_passage)
+
+
+            # syntax_question = self.syntax_encoder(syntax_question, question_mask)
+            # syntax_passage = self.syntax_encoder(syntax_passage, passage_mask)
+            # encoded_question = self.syntax_linear_layer(torch.cat((encoded_question, syntax_question), -1))
+            # encoded_passage = self.syntax_linear_layer(torch.cat((encoded_passage, syntax_passage), -1))
+
+
+        # modify_encoded_passage = encoded_passage.clone()
+        # passageidx2numberidx_mask = (passageidx2numberidx > -1).int()
+        # for batch_index, passage_number_value in enumerate(passage_number_values):
+        #     number_index = [idx2numidx.int() for idx2numidx in passageidx2numberidx[batch_index] if idx2numidx > -1]
+        #     number_value = [passage_number_value[num_idx] for num_idx in number_index]
+        #     number_log_value = torch.log10(torch.Tensor(number_value) + 1.0)
+        #     number_log_matrix = torch.zeros((number_log_value.size()[-1], encoded_passage.size()[-1])) + number_log_value.unsqueeze(-1)
+        #     modify_encoded_passage[batch_index, passageidx2numberidx_mask[batch_index].bool(), :] = number_log_matrix.to(self.device_id)
+        #
+        # encoded_passage = modify_encoded_passage
         passage_mask = (pad_mask[:, 1 + self.max_ques_len + 1 :]).float()
         passage_token_idxs = question_passage_tokens[:, 1 + self.max_ques_len + 1 :]
 
@@ -361,6 +450,43 @@ class DROPParserBERT(DROPParserBase):
             passageidx2symbolidx=passageidx2numberidx,
             passage_to_symbol_attention_params=self._executor_parameters.passage_to_num_attention
         )
+
+        # Question Alignment
+        question_passage_token2date_alignment = self.compute_question_token_symbol_alignments(
+            modeled_passage=modeled_passage,
+            passage_mask=passage_mask,
+            modeled_question=encoded_question,
+            question_mask=question_mask,
+            passageidx2symbolidx=passageidx2dateidx,
+            passage_to_symbol_attention_params=self._executor_parameters.question_to_date_attention
+        )
+
+        question_passage_token2startdate_alignment = self.compute_question_token_symbol_alignments(
+            modeled_passage=modeled_passage,
+            passage_mask=passage_mask,
+            modeled_question=encoded_question,
+            question_mask=question_mask,
+            passageidx2symbolidx=passageidx2dateidx,
+            passage_to_symbol_attention_params=self._executor_parameters.question_to_start_date_attention
+        )
+
+        question_passage_token2enddate_alignment = self.compute_question_token_symbol_alignments(
+            modeled_passage=modeled_passage,
+            passage_mask=passage_mask,
+            modeled_question=encoded_question,
+            question_mask=question_mask,
+            passageidx2symbolidx=passageidx2dateidx,
+            passage_to_symbol_attention_params=self._executor_parameters.question_to_end_date_attention
+        )
+
+        question_passage_token2num_alignment = self.compute_question_token_symbol_alignments(
+            modeled_passage=modeled_passage,
+            passage_mask=passage_mask,
+            modeled_question=encoded_question,
+            question_mask=question_mask,
+            passageidx2symbolidx=passageidx2numberidx,
+            passage_to_symbol_attention_params=self._executor_parameters.question_to_num_attention
+        )
         # json_dicts = []
         # for i in range(batch_size):
         #     ques_tokens = metadata[i]['question_tokens']
@@ -375,6 +501,8 @@ class DROPParserBERT(DROPParserBase):
         if self.auxwinloss:
             with Profile("win-mask"):
                 inwindow_mask, outwindow_mask = self.masking_blockdiagonal(passage_length, 15, self.device_id)
+                # inwindow_mask, outwindow_mask = self.masking_blockdiagonal_sentence(passage_length, 20,
+                #                                                                     passage_token_idxs, self.device_id)
             with Profile("act-loss"):
                 passage_tokenidx2numidx_mask = (passageidx2numberidx > -1).float()
                 num_aux_loss = self.window_loss_numdate(
@@ -421,6 +549,10 @@ class DROPParserBERT(DROPParserBase):
         p2pstartdate_alignment_aslist = [passage_passage_token2startdate_alignment[i] for i in range(batch_size)]
         p2penddate_alignment_aslist = [passage_passage_token2enddate_alignment[i] for i in range(batch_size)]
         p2pnum_alignment_aslist = [passage_passage_token2num_alignment[i] for i in range(batch_size)]
+        q2pdate_alignment_aslist = [question_passage_token2date_alignment[i] for i in range(batch_size)]
+        q2pstartdate_alignment_aslist = [question_passage_token2startdate_alignment[i] for i in range(batch_size)]
+        q2penddate_alignment_aslist = [question_passage_token2enddate_alignment[i] for i in range(batch_size)]
+        q2pnum_alignment_aslist = [question_passage_token2num_alignment[i] for i in range(batch_size)]
         # passage_token2datetoken_sim_aslist = [passage_token2datetoken_similarity[i] for i in range(batch_size)]
         size_composednums_aslist = [len(x) for x in composed_numbers]
         # Shape: (size_num_support_i, max_num_add_combs_i, 2) where _i is per instance
@@ -463,6 +595,10 @@ class DROPParserBERT(DROPParserBase):
                     passage_token2startdate_alignment=p2pstartdate_alignment_aslist[i],
                     passage_token2enddate_alignment=p2penddate_alignment_aslist[i],
                     passage_token2num_alignment=p2pnum_alignment_aslist[i],
+                    question_token2date_alignment=q2pdate_alignment_aslist[i],
+                    question_token2startdate_alignment=q2pstartdate_alignment_aslist[i],
+                    question_token2enddate_alignment=q2penddate_alignment_aslist[i],
+                    question_token2num_alignment=q2pnum_alignment_aslist[i],
                     parameters=self._executor_parameters,
                     start_types=None,  # batch_start_types[i],
                     device_id=self.device_id,
@@ -1046,12 +1182,53 @@ class DROPParserBERT(DROPParserBase):
             passage_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(1)
         )
         # Shape: (batch_size, passage_length, passage_length)
-        pasage_passage_token2symbol_aligment = allenutil.masked_softmax(
+        passage_passage_token2symbol_aligment = allenutil.masked_softmax(
             passage_passage_token2symbol_similarity,
             mask=passage_tokenidx2symbolidx_mask.unsqueeze(1),
             memory_efficient=True,
         )
-        return pasage_passage_token2symbol_aligment
+        return passage_passage_token2symbol_aligment
+
+    def compute_question_token_symbol_alignments(
+        self, modeled_passage, passage_mask, modeled_question, question_mask, passageidx2symbolidx, passage_to_symbol_attention_params
+    ):
+        """Compute the passage_token-to-passage_date alignment matrix.
+
+        Args:
+        -----
+            modeled_passage: (batch_size, passage_length, hidden_dim)
+                Contextual passage repr.
+            passage_mask: (batch_size, passage_length)
+                Passage mask
+            passageidx2dateidx: (batch_size, passage_length)
+                For date-tokens, the index of the date-entity it belongs to, o/w masked with value = -1
+            passage_to_date_attention_params: Some matrix-attention parameterization for computing the alignment matrix
+
+        Returns:
+        --------
+            pasage_passage_token2symbol_aligment: (batch_size, passage_length, passage_length)
+                Alignment matrix from passage_token (dim=1) to passage_date (dim=2)
+                Should be masked in dim=2 for tokens that are not date-tokens
+        """
+        # ### Passage Token - Date Alignment
+        # Shape: (batch_size, question_length, passage_length)
+        passage_passage_token2symbol_similarity = passage_to_symbol_attention_params(modeled_question, modeled_passage)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * passage_mask.unsqueeze(1)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * question_mask.unsqueeze(2)
+
+        # Shape: (batch_size, passage_length) -- masking for number tokens in the passage
+        passage_tokenidx2symbolidx_mask = (passageidx2symbolidx > -1).float()
+        # Shape: (batch_size, question_length, passage_length)
+        passage_passage_token2symbol_similarity = (
+            passage_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(1)
+        )
+        # Shape: (batch_size, question_length, passage_length)
+        passage_passage_token2symbol_aligment = allenutil.masked_softmax(
+            passage_passage_token2symbol_similarity,
+            mask=passage_tokenidx2symbolidx_mask.unsqueeze(1),
+            memory_efficient=True,
+        )
+        return passage_passage_token2symbol_aligment
 
     def compute_avg_norm(self, tensor):
         dim0_size = tensor.size()[0]
@@ -1881,6 +2058,65 @@ class DROPParserBERT(DROPParserBase):
         outwindow_mask = (lower_mask != upper_mask).float()
         return inwindow_mask, outwindow_mask
 
+    def masking_blockdiagonal_sentence(self, passage_length, window, passage_token_idxs, device_id):
+        """ Make a (passage_length, passage_length) tensor M of 1 and -1 in which for each row x,
+            M[x, y] = -1 if y < x - window or y > x + window, else it is 1.
+            Basically for the x-th row, the [x-win, x+win] columns should be 1, and rest -1
+        """
+        note_mask = (passage_token_idxs == 1012) + (passage_token_idxs == 1029) + (passage_token_idxs == 999)
+
+        left_side = []
+        right_side = []
+        for b in range(note_mask.size()[0]):
+            left_vec = []
+            right_vec = []
+            left_index = 0
+
+            for i, item in enumerate(note_mask[b]):
+                if item:
+                    left_vec.append(left_index)
+                    left_index = i
+                    while len(left_vec) > len(right_vec):
+                        right_vec.append(min(left_index, len(right_vec) + window))
+                    left_index += 1
+                    left_len = len(left_vec)
+                else:
+                    left_vec.append(max(left_index, i - window))
+
+            if passage_length < len(left_vec):
+                left_vec = left_vec[:passage_length]
+                right_vec = right_vec[:passage_length]
+            else:
+                left_index = left_vec[len(left_vec) - 1] + 1
+                while len(left_vec) < passage_length:
+                    left_vec.append(max(left_index, len(left_vec) - window))
+                while len(right_vec) < passage_length:
+                    right_vec.append(min(passage_length - 1, len(right_vec) + window))
+
+            left_side.append(left_vec)
+            right_side.append(right_vec)
+
+        if device_id != -1:
+            lower_un = torch.Tensor(left_side).cuda(device_id).unsqueeze(-1)
+            upper_un = torch.Tensor(right_side).cuda(device_id).unsqueeze(-1)
+        else:
+            lower_un = torch.Tensor(left_side).unsqueeze(-1)
+            upper_un = torch.Tensor(right_side).unsqueeze(-1)
+
+        # Range vector for each row
+        lower_range_vector = allenutil.get_range_vector(passage_length, device=device_id).unsqueeze(0)
+        upper_range_vector = allenutil.get_range_vector(passage_length, device=device_id).unsqueeze(0)
+
+        # Masks for lower and upper limits of the mask
+        lower_mask = lower_range_vector >= lower_un
+        upper_mask = upper_range_vector <= upper_un
+
+        # Final-mask that we require
+        inwindow_mask = (lower_mask == upper_mask).float()
+        outwindow_mask = (lower_mask != upper_mask).float()
+
+        return inwindow_mask, outwindow_mask
+
     def window_loss_numdate(self, passage_passage_alignment, passage_tokenidx_mask, inwindow_mask, outwindow_mask):
         """
         The idea is to first softmax the similarity_scores to get a distribution over the date/num tokens from each
@@ -1911,7 +2147,7 @@ class DROPParserBERT(DROPParserBase):
         sum_inwindow_probs = inwindow_probs.sum(2)
         mask_sum = (inwindow_mask.sum(2) > 0).float()
         # Image a row where mask = 0, there sum of probs will be zero and we need to compute masked_log
-        masked_sum_inwindow_probs = allenutil.replace_masked_values(sum_inwindow_probs, mask_sum, replace_with=1e-15)
+        masked_sum_inwindow_probs = allenutil.replace_masked_values(sum_inwindow_probs, mask_sum, replace_with=1e-40)
         log_sum_inwindow_probs = torch.log(masked_sum_inwindow_probs + 1e-15) * mask_sum
         inwindow_likelihood = torch.sum(log_sum_inwindow_probs)
         if torch.sum(inwindow_mask) > 0:
@@ -1925,7 +2161,7 @@ class DROPParserBERT(DROPParserBase):
         # Shape: (batch_size, passage_length, passage_length)
         outwindow_probs = passage_passage_alignment * outwindow_mask
 
-        masked_outwindow_probs = allenutil.replace_masked_values(outwindow_probs, outwindow_mask, replace_with=1e-15)
+        masked_outwindow_probs = allenutil.replace_masked_values(outwindow_probs, outwindow_mask, replace_with=1e-40)
         outwindow_probs_log = torch.log(masked_outwindow_probs + 1e-15) * outwindow_mask
         # Shape: (batch_length, passage_length)
         outwindow_negentropies = torch.sum(outwindow_probs * outwindow_probs_log)
