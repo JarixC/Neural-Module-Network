@@ -310,6 +310,9 @@ class DROPParserBERT(DROPParserBase):
         passage_mask = (pad_mask[:, 1 + self.max_ques_len + 1:]).float()
         passage_token_idxs = question_passage_tokens[:, 1 + self.max_ques_len + 1 :]
 
+        encoded_context = torch.cat([encoded_passage, encoded_question], dim=1)
+        context_mask = torch.cat([passage_mask, question_mask], dim=1)
+
         batch_size = len(actions)
 
         if epoch_num is not None:
@@ -320,6 +323,7 @@ class DROPParserBERT(DROPParserBase):
 
         modeled_passage = encoded_passage
         passage_length = modeled_passage.size()[1]
+        question_length = encoded_question.size()[1]
 
         question_passage_similarity = self.qp_matrix_attention(encoded_question, modeled_passage)
         passage_question_similarity = question_passage_similarity.transpose(1, 2)
@@ -334,54 +338,35 @@ class DROPParserBERT(DROPParserBase):
 
         # Passage Token - Date Alignment
         # Shape: (batch_size, passage_length, passage_length)
-        passage_passage_token2date_alignment = self.compute_token_symbol_alignments(
+        passage_passage_token2date_alignment = self.compute_context_token_symbol_alignments(
             modeled_passage=modeled_passage,
             passage_mask=passage_mask,
+            modeled_context=encoded_context,
+            context_mask=context_mask,
             passageidx2symbolidx=passageidx2dateidx,
             passage_to_symbol_attention_params=self._executor_parameters.passage_to_date_attention
         )
+        print(f'parser-alignment1: {passage_passage_token2date_alignment.shape}')
 
-        passage_passage_token2startdate_alignment = self.compute_token_symbol_alignments(
+        passage_passage_token2startdate_alignment = self.compute_context_token_symbol_alignments(
             modeled_passage=modeled_passage,
             passage_mask=passage_mask,
+            modeled_context=encoded_context,
+            context_mask=context_mask,
             passageidx2symbolidx=passageidx2dateidx,
             passage_to_symbol_attention_params=self._executor_parameters.passage_to_start_date_attention
         )
+        print(f'parser-alignment2: {passage_passage_token2startdate_alignment.shape}')
 
-        passage_passage_token2enddate_alignment = self.compute_token_symbol_alignments(
+        passage_passage_token2enddate_alignment = self.compute_context_token_symbol_alignments(
             modeled_passage=modeled_passage,
             passage_mask=passage_mask,
+            modeled_context=encoded_context,
+            context_mask=context_mask,
             passageidx2symbolidx=passageidx2dateidx,
             passage_to_symbol_attention_params=self._executor_parameters.passage_to_end_date_attention
         )
-
-        # Question Alignment
-        question_passage_token2date_alignment = self.compute_question_token_symbol_alignments(
-            modeled_passage=modeled_passage,
-            passage_mask=passage_mask,
-            modeled_question=encoded_question,
-            question_mask=question_mask,
-            passageidx2symbolidx=passageidx2dateidx,
-            passage_to_symbol_attention_params=self._executor_parameters.passage_to_date_attention
-        )
-
-        question_passage_token2startdate_alignment = self.compute_question_token_symbol_alignments(
-            modeled_passage=modeled_passage,
-            passage_mask=passage_mask,
-            modeled_question=encoded_question,
-            question_mask=question_mask,
-            passageidx2symbolidx=passageidx2dateidx,
-            passage_to_symbol_attention_params=self._executor_parameters.passage_to_start_date_attention
-        )
-
-        question_passage_token2enddate_alignment = self.compute_question_token_symbol_alignments(
-            modeled_passage=modeled_passage,
-            passage_mask=passage_mask,
-            modeled_question=encoded_question,
-            question_mask=question_mask,
-            passageidx2symbolidx=passageidx2dateidx,
-            passage_to_symbol_attention_params=self._executor_parameters.passage_to_end_date_attention
-        )
+        print(f'parser-alignment3: {passage_passage_token2enddate_alignment.shape}')
 
         # Passage Token - Num Alignment
         passage_passage_token2num_alignment = self.compute_token_symbol_alignments(
@@ -403,25 +388,26 @@ class DROPParserBERT(DROPParserBase):
         """ Aux Loss """
         if self.auxwinloss:
             with Profile("win-mask"):
-                inwindow_mask, outwindow_mask = self.masking_blockdiagonal(passage_length, 15, self.device_id)
+                num_inwindow_mask, num_outwindow_mask = self.masking_blockdiagonal(passage_length, 15, self.device_id)
+                date_inwindow_mask, date_outwindow_mask = self.context_masking_blockdiagonal(passage_length, (passage_length+question_length), 15, self.device_id)
             with Profile("act-loss"):
                 passage_tokenidx2numidx_mask = (passageidx2numberidx > -1).float()
                 num_aux_loss = self.window_loss_numdate(
-                    passage_passage_token2num_alignment, passage_tokenidx2numidx_mask, inwindow_mask, outwindow_mask
-                )
+                    passage_passage_token2num_alignment, passage_tokenidx2numidx_mask, num_inwindow_mask,
+                    num_outwindow_mask)
 
                 passage_tokenidx2dateidx_mask = (passageidx2dateidx > -1).float()
                 date_aux_loss = self.window_loss_numdate(
-                    passage_passage_token2date_alignment, passage_tokenidx2dateidx_mask, inwindow_mask, outwindow_mask
-                )
+                    passage_passage_token2date_alignment, passage_tokenidx2dateidx_mask, date_inwindow_mask,
+                    date_outwindow_mask)
 
                 start_date_aux_loss = self.window_loss_numdate(
-                    passage_passage_token2startdate_alignment, passage_tokenidx2dateidx_mask, inwindow_mask,
-                    outwindow_mask)
+                    passage_passage_token2startdate_alignment, passage_tokenidx2dateidx_mask, date_inwindow_mask,
+                    date_outwindow_mask)
 
                 end_date_aux_loss = self.window_loss_numdate(
-                    passage_passage_token2enddate_alignment, passage_tokenidx2dateidx_mask, inwindow_mask,
-                    outwindow_mask)
+                    passage_passage_token2enddate_alignment, passage_tokenidx2dateidx_mask, date_inwindow_mask,
+                    date_outwindow_mask)
                 aux_win_loss = num_aux_loss + date_aux_loss + start_date_aux_loss + end_date_aux_loss
         else:
             aux_win_loss = 0.0
@@ -450,10 +436,6 @@ class DROPParserBERT(DROPParserBase):
         p2pstartdate_alignment_aslist = [passage_passage_token2startdate_alignment[i] for i in range(batch_size)]
         p2penddate_alignment_aslist = [passage_passage_token2enddate_alignment[i] for i in range(batch_size)]
         p2pnum_alignment_aslist = [passage_passage_token2num_alignment[i] for i in range(batch_size)]
-        q2pdate_alignment_aslist = [question_passage_token2date_alignment[i] for i in range(batch_size)]
-        q2pstartdate_alignment_aslist = [question_passage_token2startdate_alignment[i] for i in range(batch_size)]
-        q2penddate_alignment_aslist = [question_passage_token2enddate_alignment[i] for i in range(batch_size)]
-
         # passage_token2datetoken_sim_aslist = [passage_token2datetoken_similarity[i] for i in range(batch_size)]
         size_composednums_aslist = [len(x) for x in composed_numbers]
         # Shape: (size_num_support_i, max_num_add_combs_i, 2) where _i is per instance
@@ -496,9 +478,6 @@ class DROPParserBERT(DROPParserBase):
                     passage_token2startdate_alignment=p2pstartdate_alignment_aslist[i],
                     passage_token2enddate_alignment=p2penddate_alignment_aslist[i],
                     passage_token2num_alignment=p2pnum_alignment_aslist[i],
-                    question_token2date_alignment=q2pdate_alignment_aslist[i],
-                    question_token2startdate_alignment=q2pstartdate_alignment_aslist[i],
-                    question_token2enddate_alignment=q2penddate_alignment_aslist[i],
                     parameters=self._executor_parameters,
                     start_types=None,  # batch_start_types[i],
                     device_id=self.device_id,
@@ -824,7 +803,7 @@ class DROPParserBERT(DROPParserBase):
                     elif progtype == "YearDifference":
                         # Distribution over year_differences
                         pred_year_difference_dist = denotation._value
-                        pred_year_diff_log_probs = torch.log(pred_year_difference_dist + 1e-40)
+                        pred_year_diff_log_probs = torch.log(pred_year_difference_dist + 1e-15)
                         gold_year_difference_dist = allenutil.move_to_device(
                             torch.FloatTensor(answer_as_year_difference[i]), cuda_device=self.device_id
                         )
@@ -832,7 +811,7 @@ class DROPParserBERT(DROPParserBase):
                     elif progtype == "PassageNumber":
                         # Distribution over PassageNumbers
                         pred_passagenumber_dist = denotation._value
-                        pred_passagenumber_logprobs = torch.log(pred_passagenumber_dist + 1e-40)
+                        pred_passagenumber_logprobs = torch.log(pred_passagenumber_dist + 1e-15)
                         gold_passagenum_dist = allenutil.move_to_device(
                             torch.FloatTensor(answer_as_passage_number[i]), cuda_device=self.device_id
                         )
@@ -840,14 +819,14 @@ class DROPParserBERT(DROPParserBase):
                     elif progtype == "ComposedNumber":
                         # Distribution over ComposedNumbers
                         pred_composednumber_dist = denotation._value
-                        pred_composednumber_logprobs = torch.log(pred_composednumber_dist + 1e-40)
+                        pred_composednumber_logprobs = torch.log(pred_composednumber_dist + 1e-15)
                         gold_composednum_dist = allenutil.move_to_device(
                             torch.FloatTensor(answer_as_composed_number[i]), cuda_device=self.device_id
                         )
                         log_likelihood = torch.sum(pred_composednumber_logprobs * gold_composednum_dist)
                     elif progtype == "CountNumber":
                         count_distribution = denotation._value
-                        count_log_probs = torch.log(count_distribution + 1e-40)
+                        count_log_probs = torch.log(count_distribution + 1e-15)
                         gold_count_distribution = allenutil.move_to_device(
                             torch.FloatTensor(answer_as_count[i]), cuda_device=self.device_id
                         )
@@ -1089,29 +1068,33 @@ class DROPParserBERT(DROPParserBase):
         )
         return passage_passage_token2symbol_aligment
 
-    def compute_question_token_symbol_alignments(
-            self, modeled_passage, passage_mask, modeled_question, question_mask, passageidx2symbolidx,
+    def compute_context_token_symbol_alignments(
+            self, modeled_passage, passage_mask, modeled_context, context_mask, passageidx2symbolidx,
             passage_to_symbol_attention_params
     ):
         # ### Passage Token - Date Alignment
-        # Shape:
-        question_passage_token2symbol_similarity = passage_to_symbol_attention_params(modeled_question, modeled_passage)
-        question_passage_token2symbol_similarity = question_passage_token2symbol_similarity * passage_mask.unsqueeze(1)
-        question_passage_token2symbol_similarity = question_passage_token2symbol_similarity * question_mask.unsqueeze(2)
+        # Shape: (batch_size, passage_length, context_length)
+        passage_passage_token2symbol_similarity = passage_to_symbol_attention_params(modeled_passage, modeled_context)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * context_mask.unsqueeze(1)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * passage_mask.unsqueeze(2)
 
         # Shape: (batch_size, passage_length) -- masking for number tokens in the passage
         passage_tokenidx2symbolidx_mask = (passageidx2symbolidx > -1).float()
+
         # Shape:
-        question_passage_token2symbol_similarity = (
-                question_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(1)
+        passage_passage_token2symbol_similarity = (
+                passage_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(1)
         )
-        # Shape: (batch_size, passage_length, passage_length)
-        question_passage_token2symbol_aligment = allenutil.masked_softmax(
-            question_passage_token2symbol_similarity,
+        print(f'parser-context: {modeled_context.shape}')
+        print(f'parser-similar: {passage_passage_token2symbol_similarity.shape}')
+
+        # Shape: (batch_size, passage_length, context_length)
+        passage_passage_token2symbol_aligment = allenutil.masked_softmax(
+            passage_passage_token2symbol_similarity,
             mask=passage_tokenidx2symbolidx_mask.unsqueeze(1),
             memory_efficient=True,
         )
-        return question_passage_token2symbol_aligment
+        return passage_passage_token2symbol_aligment
 
     def compute_avg_norm(self, tensor):
         dim0_size = tensor.size()[0]
@@ -1941,6 +1924,39 @@ class DROPParserBERT(DROPParserBase):
         outwindow_mask = (lower_mask != upper_mask).float()
         return inwindow_mask, outwindow_mask
 
+    def context_masking_blockdiagonal(self, passage_length, context_length, window, device_id):
+        """ Make a (passage_length, passage_length) tensor M of 1 and -1 in which for each row x,
+            M[x, y] = -1 if y < x - window or y > x + window, else it is 1.
+            Basically for the x-th row, the [x-win, x+win] columns should be 1, and rest -1
+        """
+
+        # The lower and upper limit of token-idx that won't be masked for a given token
+        lower = allenutil.get_range_vector(passage_length, device=device_id) - window
+        upper = allenutil.get_range_vector(passage_length, device=device_id) + window
+        lower = torch.clamp(lower, min=0, max=passage_length - 1)
+        upper = torch.clamp(upper, min=0, max=passage_length - 1)
+        lower_un = lower.unsqueeze(1)
+        upper_un = upper.unsqueeze(1)
+
+        # Range vector for each row
+        lower_range_vector = allenutil.get_range_vector(context_length, device=device_id).unsqueeze(0)
+        upper_range_vector = allenutil.get_range_vector(context_length, device=device_id).unsqueeze(0)
+
+        # Masks for lower and upper limits of the mask
+        lower_mask = lower_range_vector >= lower_un
+        upper_mask = upper_range_vector <= upper_un
+
+        # Final-mask that we require
+        inwindow_mask = (lower_mask == upper_mask).float()
+        outwindow_mask = (lower_mask != upper_mask).float()
+
+        # zero the value for question tokens part
+        for row in range(inwindow_mask.shape[0]):
+            inwindow_mask[row, passage_length:] = 0
+            outwindow_mask[row, passage_length:] = 0
+
+        return inwindow_mask, outwindow_mask
+
     def window_loss_numdate(self, passage_passage_alignment, passage_tokenidx_mask, inwindow_mask, outwindow_mask):
         """
         The idea is to first softmax the similarity_scores to get a distribution over the date/num tokens from each
@@ -1971,7 +1987,7 @@ class DROPParserBERT(DROPParserBase):
         sum_inwindow_probs = inwindow_probs.sum(2)
         mask_sum = (inwindow_mask.sum(2) > 0).float()
         # Image a row where mask = 0, there sum of probs will be zero and we need to compute masked_log
-        masked_sum_inwindow_probs = allenutil.replace_masked_values(sum_inwindow_probs, mask_sum, replace_with=1e-40)
+        masked_sum_inwindow_probs = allenutil.replace_masked_values(sum_inwindow_probs, mask_sum, replace_with=1e-15)
         log_sum_inwindow_probs = torch.log(masked_sum_inwindow_probs + 1e-15) * mask_sum
         inwindow_likelihood = torch.sum(log_sum_inwindow_probs)
         if torch.sum(inwindow_mask) > 0:
@@ -1985,7 +2001,7 @@ class DROPParserBERT(DROPParserBase):
         # Shape: (batch_size, passage_length, passage_length)
         outwindow_probs = passage_passage_alignment * outwindow_mask
 
-        masked_outwindow_probs = allenutil.replace_masked_values(outwindow_probs, outwindow_mask, replace_with=1e-40)
+        masked_outwindow_probs = allenutil.replace_masked_values(outwindow_probs, outwindow_mask, replace_with=1e-15)
         outwindow_probs_log = torch.log(masked_outwindow_probs + 1e-15) * outwindow_mask
         # Shape: (batch_length, passage_length)
         outwindow_negentropies = torch.sum(outwindow_probs * outwindow_probs_log)
