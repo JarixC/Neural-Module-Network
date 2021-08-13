@@ -230,9 +230,6 @@ def get_empty_language_object():
         passage_token2startdate_alignment=None,
         passage_token2enddate_alignment=None,
         passage_token2num_alignment=None,
-        question_token2date_alignment=None,
-        question_token2startdate_alignment=None,
-        question_token2enddate_alignment=None,
         parameters=None,
         start_types=None,
     )
@@ -281,9 +278,6 @@ class DropLanguage(DomainLanguage):
             passage_token2startdate_alignment: Tensor,
             passage_token2enddate_alignment: Tensor,
             passage_token2num_alignment: Tensor,
-            question_token2date_alignment: Tensor,
-            question_token2startdate_alignment: Tensor,
-            question_token2enddate_alignment: Tensor,
             parameters: ExecutorParameters,
             modeled_passage: Tensor = None,
             start_types=None,
@@ -378,9 +372,6 @@ class DropLanguage(DomainLanguage):
         self.passage_passage_token2startdate_alignment = passage_token2startdate_alignment
         self.passage_passage_token2enddate_alignment = passage_token2enddate_alignment
         self.passage_passage_token2num_alignment = passage_token2num_alignment
-        self.question_passage_token2date_alignment = question_token2date_alignment
-        self.question_passage_token2startdate_alignment = question_token2startdate_alignment
-        self.question_passage_token2enddate_alignment = question_token2enddate_alignment
         initialization_returns = self.initialize()
         self.date_lt_mat = initialization_returns["date_lt_mat"]
         self.date_gt_mat = initialization_returns["date_gt_mat"]
@@ -397,9 +388,6 @@ class DropLanguage(DomainLanguage):
         # List[int]
         self.count_num_values = count_num_values
         self.countvals = allenutil.move_to_device(torch.FloatTensor(range(0, 10)), cuda_device=self.device_id)
-
-        # question to date alignment flag
-        self.date_question_alignment = False
 
         # This is a list of list, where each list element corresponds to one program execution. Each element stores
         # details related to the module execution as added by the modules below.
@@ -690,26 +678,21 @@ class DropLanguage(DomainLanguage):
 
             if date_type is None:
                 passage_date_alignment_matrix = self.passage_passage_token2date_alignment
-                question_date_alignment_matrix = self.question_passage_token2date_alignment
             elif date_type == "start":
                 passage_date_alignment_matrix = self.passage_passage_token2startdate_alignment
-                question_date_alignment_matrix = self.question_passage_token2startdate_alignment
             elif date_type == "end":
                 passage_date_alignment_matrix = self.passage_passage_token2enddate_alignment
-                question_date_alignment_matrix = self.question_passage_token2enddate_alignment
             else:
                 raise NotImplementedError
 
-            attn_weighted_date_aligment_matrix = passage_date_alignment_matrix * passage_attention.unsqueeze(1)
+            context_attention = torch.cat([passage_attention, question_attention], dim=0)
+
+            print(f'lang-matrix: {passage_date_alignment_matrix.shape}')
+            print(f'context-attn: {context_attention.unsqueeze(1).shape}')
+
+            attn_weighted_date_aligment_matrix = passage_date_alignment_matrix * context_attention.unsqueeze(0)
             # Shape: (passage_length, )
             passage_date_token_probs = attn_weighted_date_aligment_matrix.sum(0)
-
-            if question_attention is not None and self.date_question_alignment:
-                lambd = 0.5
-                # (question_length, passage_length)
-                attn_weighted_date_aligment_matrix = question_date_alignment_matrix * question_attention.unsqueeze(1)
-                passage_date_token_probs = lambd * passage_date_token_probs + \
-                                           (1 - lambd) * attn_weighted_date_aligment_matrix.sum(0)
 
             """
             if self._debug:
@@ -1083,13 +1066,9 @@ class DropLanguage(DomainLanguage):
             self, passage_attn_1: PassageAttention, passage_attn_2: PassageAttention,
             event_date_groundings=None, question_attention=None
     ) -> PassageAttention_answer:
-        if self.date_question_alignment:
-            question_attn = question_attention * self.question_mask
-        else:
-            question_attn = None
-
         passage_attention_1 = passage_attn_1._value * self.passage_mask
         passage_attention_2 = passage_attn_2._value * self.passage_mask
+        question_attn = question_attention * self.question_mask
 
         (
             date_distribution_1,
@@ -1150,13 +1129,10 @@ class DropLanguage(DomainLanguage):
             event_date_groundings=None, question_attention=None
     ) -> PassageAttention_answer:
         """ In short; outputs PA_1 if D1 > D2 i.e. is PA_1 occurred after PA_2 """
-        if self.date_question_alignment:
-            question_attn = question_attention * self.question_mask
-        else:
-            question_attn = None
 
         passage_attention_1 = passage_attn_1._value * self.passage_mask
         passage_attention_2 = passage_attn_2._value * self.passage_mask
+        question_attn = question_attention * self.question_mask
 
         (
             date_distribution_1,
@@ -1331,13 +1307,10 @@ class DropLanguage(DomainLanguage):
     def year_difference(self, passage_attn_1: PassageAttention, passage_attn_2: PassageAttention,
                         question_attention: Tensor = None) -> YearDifference:
         """ Given two passage spans, ground them to dates, and then return the difference between their years """
-        if self.date_question_alignment:
-            question_attn = question_attention * self.question_mask
-        else:
-            question_attn = None
 
         passage_attention_1 = passage_attn_1._value * self.passage_mask
         passage_attention_2 = passage_attn_2._value * self.passage_mask
+        question_attn = question_attention * self.question_mask
 
         date_distribution_1, passage_datetoken_prob_1, d1_dist_entropy \
             = self.compute_date_scores(passage_attention_1, date_type=None, question_attention=question_attn)
@@ -1383,12 +1356,8 @@ class DropLanguage(DomainLanguage):
                                      question_attention: Tensor = None) -> YearDifference:
         """ Given a single passage span, find its start and end dates, then return the difference in years """
 
-        if self.date_question_alignment:
-            question_attn = question_attention * self.question_mask
-        else:
-            question_attn = None
-
         passage_attention = passage_attn._value * self.passage_mask
+        question_attn = question_attention * self.question_mask
 
         # DATE_1 is end since the difference is computed as DATE_1 - DATE_2
         date_distribution_1, passage_datetoken_prob_1, d1_dist_entropy \
