@@ -1073,28 +1073,26 @@ class DROPParserBERT(DROPParserBase):
             passage_to_symbol_attention_params
     ):
         # ### Passage Token - Date Alignment
-        # Shape: (batch_size, passage_length, context_length)
-        passage_passage_token2symbol_similarity = passage_to_symbol_attention_params(modeled_passage, modeled_context)
-        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * context_mask.unsqueeze(1)
-        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * passage_mask.unsqueeze(2)
+        # Shape: (batch_size, context_length, passage_length)
+        passage_passage_token2symbol_similarity = passage_to_symbol_attention_params(modeled_context, modeled_passage)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * passage_mask.unsqueeze(1)
+        passage_passage_token2symbol_similarity = passage_passage_token2symbol_similarity * context_mask.unsqueeze(2)
 
-        # Shape: (batch_size, passage_length) -- masking for number tokens in the passage
+        # Shape: (batch_size, context_length) -- masking for number tokens in the passage
         passage_tokenidx2symbolidx_mask = (passageidx2symbolidx > -1).float()
 
         # Shape:
         passage_passage_token2symbol_similarity = (
-                passage_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(1)
+                passage_passage_token2symbol_similarity * passage_tokenidx2symbolidx_mask.unsqueeze(2)
         )
-        print(f'parser-context: {modeled_context.shape}')
-        print(f'parser-similar: {passage_passage_token2symbol_similarity.shape}')
 
         # Shape: (batch_size, passage_length, context_length)
-        passage_passage_token2symbol_aligment = allenutil.masked_softmax(
+        passage_passage_token2symbol_alignment = allenutil.masked_softmax(
             passage_passage_token2symbol_similarity,
-            mask=passage_tokenidx2symbolidx_mask.unsqueeze(1),
+            mask=passage_tokenidx2symbolidx_mask.unsqueeze(2),
             memory_efficient=True,
         )
-        return passage_passage_token2symbol_aligment
+        return passage_passage_token2symbol_alignment
 
     def compute_avg_norm(self, tensor):
         dim0_size = tensor.size()[0]
@@ -1931,16 +1929,16 @@ class DROPParserBERT(DROPParserBase):
         """
 
         # The lower and upper limit of token-idx that won't be masked for a given token
-        lower = allenutil.get_range_vector(passage_length, device=device_id) - window
-        upper = allenutil.get_range_vector(passage_length, device=device_id) + window
+        lower = allenutil.get_range_vector(context_length, device=device_id) - window
+        upper = allenutil.get_range_vector(context_length, device=device_id) + window
         lower = torch.clamp(lower, min=0, max=passage_length - 1)
         upper = torch.clamp(upper, min=0, max=passage_length - 1)
         lower_un = lower.unsqueeze(1)
         upper_un = upper.unsqueeze(1)
 
         # Range vector for each row
-        lower_range_vector = allenutil.get_range_vector(context_length, device=device_id).unsqueeze(0)
-        upper_range_vector = allenutil.get_range_vector(context_length, device=device_id).unsqueeze(0)
+        lower_range_vector = allenutil.get_range_vector(passage_length, device=device_id).unsqueeze(0)
+        upper_range_vector = allenutil.get_range_vector(passage_length, device=device_id).unsqueeze(0)
 
         # Masks for lower and upper limits of the mask
         lower_mask = lower_range_vector >= lower_un
@@ -1951,9 +1949,11 @@ class DROPParserBERT(DROPParserBase):
         outwindow_mask = (lower_mask != upper_mask).float()
 
         # zero the value for question tokens part
-        for row in range(inwindow_mask.shape[0]):
-            inwindow_mask[row, passage_length:] = 0
-            outwindow_mask[row, passage_length:] = 0
+        inwindow_mask[passage_length:, ] = 0
+        outwindow_mask[passage_length:, ] = 0
+        # for row in range(inwindow_mask.shape[0]):
+        #     inwindow_mask[row, passage_length:] = 0
+        #     outwindow_mask[row, passage_length:] = 0
 
         return inwindow_mask, outwindow_mask
 
@@ -1980,7 +1980,7 @@ class DROPParserBERT(DROPParserBase):
         outwindow_mask: (passage_length, passage_length)
             Opposite of inwindow_mask. For each row x, the columns are 1 outside of a window around x
         """
-        inwindow_mask = inwindow_mask.unsqueeze(0) * passage_tokenidx_mask.unsqueeze(1)
+        inwindow_mask = inwindow_mask.unsqueeze(0) * passage_tokenidx_mask.unsqueeze(2)
         inwindow_probs = passage_passage_alignment * inwindow_mask
         # This signifies that each token can distribute it's prob to nearby-date/num in anyway
         # Shape: (batch_size, passage_length)
@@ -1995,7 +1995,7 @@ class DROPParserBERT(DROPParserBase):
         else:
             inwindow_likelihood = 0.0
 
-        outwindow_mask = outwindow_mask.unsqueeze(0) * passage_tokenidx_mask.unsqueeze(1)
+        outwindow_mask = outwindow_mask.unsqueeze(0) * passage_tokenidx_mask.unsqueeze(2)
         # For tokens outside the window, increase entropy of the distribution. i.e. -\sum p*log(p)
         # Since we'd like to distribute the weight equally to things outside the window
         # Shape: (batch_size, passage_length, passage_length)
