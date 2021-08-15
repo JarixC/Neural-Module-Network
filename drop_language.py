@@ -690,9 +690,9 @@ class DropLanguage(DomainLanguage):
             print(f'lang-matrix: {passage_date_alignment_matrix.shape}')
             print(f'context-attn: {context_attention.unsqueeze(1).shape}')
 
-            attn_weighted_date_aligment_matrix = passage_date_alignment_matrix * context_attention.unsqueeze(0)
+            attn_weighted_date_aligment_matrix = passage_date_alignment_matrix * context_attention.unsqueeze(1)
             # Shape: (passage_length, )
-            passage_date_token_probs = attn_weighted_date_aligment_matrix.sum(0)
+            passage_date_token_probs = attn_weighted_date_aligment_matrix.sum(1)
 
             """
             if self._debug:
